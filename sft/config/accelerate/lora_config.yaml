@@ -1,0 +1,13 @@
+compute_environment: LOCAL_MACHINE         # 计算环境类型
+debug: false                              # 是否开启调试模式
+deepspeed_config:                         # DeepSpeed相关配置
+  zero3_init_flag: false                  # 是否启用ZeRO-3初始化
+  zero_stage: 1                           # ZeRO优化阶段
+distributed_type: DEEPSPEED               # 分布式类型
+downcast_bf16: 'no'                       # 是否降级为bf16
+machine_rank: 0                           # 当前机器编号
+main_training_function: main              # 主训练函数
+mixed_precision: bf16                     # 混合精度类型
+num_machines: 1                           # 机器数量
+num_processes: 8                          # 进程数量
+main_process_port: 20658
