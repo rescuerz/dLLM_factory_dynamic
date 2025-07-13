@@ -9,15 +9,33 @@ from argsparser import ArgsProcessor
 from utils import TransformerModelLoader,LoraBuilder
 from datasets import load_dataset
 def load_data(args, tokenizer):
+    # 如果是本地json文件，则直接加载
     if args.train_data.endswith('.json'):
         from datasets import Dataset
         import json
         with open(args.train_data, 'r', encoding='utf-8') as f:
             data = json.load(f)
         data = Dataset.from_list(data)
+    # 如果是HuggingFace数据集，则使用load_dataset从huggingface下载并加载数据集
     else:
-        data = load_dataset(args.train_data, split="train")
+        print("从HuggingFace Hub加载数据集...")
 
+        # 处理特殊数据集的配置
+        dataset_config = None
+        if args.train_data == "gsm8k":
+            dataset_config = "main"  # gsm8k 默认使用 main 配置
+            print(f"检测到 gsm8k 数据集，使用配置: {dataset_config}")
+
+        # 加载数据集
+        if dataset_config:
+            data = load_dataset(args.train_data, dataset_config, split="train")
+        else:
+            data = load_dataset(args.train_data, split="train")
+
+        data_len = len(data)  # type: ignore
+        print(f"成功从 {args.train_data} 加载了 {data_len} 个训练样本")
+
+    # 对数据进行预处理
     train_data, eval_data = preprocess_dataset(data, tokenizer, args.max_length)
     print("Train data length: ", len(train_data))
     print("Eval data length: ", len(eval_data))

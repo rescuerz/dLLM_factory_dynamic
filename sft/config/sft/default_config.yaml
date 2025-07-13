@@ -6,7 +6,7 @@ learning_rate: 1e-5                        # 优化器学习率
 grad_accum_steps: 1                        # 梯度累积步数
 output_dir: "./sft_save"                   # 模型与日志保存目录
 job_name: "llada-sft"                      # 任务名称
-train_data: "simplescaling/s1K"            # 训练数据路径
+train_data: "gsm8k"            # 训练数据路径
 max_grad_norm: 1.0                         # 梯度裁剪阈值
 weight_decay: 0.1                          # 权重衰减
 evaluation_strategy: "steps"               # 评估策略

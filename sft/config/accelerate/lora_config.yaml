@@ -9,5 +9,5 @@ machine_rank: 0                           # 当前机器编号
 main_training_function: main              # 主训练函数
 mixed_precision: bf16                     # 混合精度类型
 num_machines: 1                           # 机器数量
-num_processes: 8                          # 进程数量
+num_processes: 2                          # 进程数量
 main_process_port: 20658
