@@ -8,6 +8,98 @@ from trainer import dLLMTrainer
 from argsparser import ArgsProcessor
 from utils import TransformerModelLoader,LoraBuilder
 from datasets import load_dataset
+
+# Special Token定义
+SPECIAL_TOKENS = {
+    "expand": "<|expand|>",  # 扩展token
+    "enough": "<|enough|>"   # 结束token
+}
+
+def ensure_special_tokens_in_tokenizer(tokenizer):
+    """
+    确保特殊token在tokenizer词汇表中
+
+    Returns:
+        bool: 是否添加了新的特殊token
+    """
+    special_tokens = list(SPECIAL_TOKENS.values())
+    existing_tokens = set(tokenizer.get_vocab().keys())
+    new_tokens = [token for token in special_tokens if token not in existing_tokens]
+
+    if new_tokens:
+        special_tokens_dict = {'additional_special_tokens': new_tokens}
+        num_added = tokenizer.add_special_tokens(special_tokens_dict)
+        print(f"训练初始化：添加了 {num_added} 个特殊token: {new_tokens}")
+        return True
+    return False
+
+def setup_model_and_tokenizer_for_special_tokens(model, tokenizer):
+    """
+    为训练脚本提供的工具函数：设置模型和tokenizer以支持特殊token
+
+    Args:
+        model: 预训练模型
+        tokenizer: 预训练tokenizer
+
+    Returns:
+        tuple: (model, tokenizer, tokens_added) - 是否添加了新token
+    """
+    # 记录原始状态
+    original_tokenizer_size = len(tokenizer)
+    original_model_embedding_size = model.get_input_embeddings().weight.size(0)
+
+    print(f"原始状态检查:")
+    print(f"  Tokenizer词汇表大小: {original_tokenizer_size}")
+    print(f"  模型embedding层大小: {original_model_embedding_size}")
+
+    # 检查原始状态是否正常
+    if original_model_embedding_size != original_tokenizer_size:
+        size_diff = original_model_embedding_size - original_tokenizer_size
+        print(f"⚠️  警告: 模型embedding层与tokenizer大小不匹配 (差异: {size_diff})")
+        if size_diff < 0:
+            print(f"❌ 严重错误: 模型embedding层小于tokenizer词汇表，这会导致训练错误")
+            raise ValueError(f"模型embedding层({original_model_embedding_size}) < tokenizer词汇表({original_tokenizer_size})")
+
+    tokens_added = ensure_special_tokens_in_tokenizer(tokenizer)
+
+    if tokens_added:
+        new_tokenizer_size = len(tokenizer)
+        expected_new_embedding_size = max(original_model_embedding_size, new_tokenizer_size)
+
+        print(f"特殊token添加后:")
+        print(f"  新tokenizer词汇表大小: {new_tokenizer_size}")
+        print(f"  预期模型embedding层大小: {expected_new_embedding_size}")
+
+        # 安全的embedding层调整
+        if new_tokenizer_size > original_model_embedding_size:
+            # 只有当tokenizer变大时才调整模型
+            print(f"正在扩展模型embedding层: {original_model_embedding_size} -> {new_tokenizer_size}")
+            model.resize_token_embeddings(new_tokenizer_size)
+            actual_new_size = model.get_input_embeddings().weight.size(0)
+            print(f"✅ 模型embedding层已扩展: {original_model_embedding_size} -> {actual_new_size}")
+        elif new_tokenizer_size == original_model_embedding_size:
+            print(f"✅ 模型embedding层大小已匹配，无需调整")
+
+        # 验证最终状态
+        final_tokenizer_size = len(tokenizer)
+        final_model_embedding_size = model.get_input_embeddings().weight.size(0)
+
+        if final_model_embedding_size >= final_tokenizer_size:
+            print(f"✅ 最终状态验证通过:")
+            print(f"  Tokenizer: {final_tokenizer_size}, 模型embedding: {final_model_embedding_size}")
+        else:
+            print(f"❌ 最终状态验证失败:")
+            print(f"  Tokenizer: {final_tokenizer_size}, 模型embedding: {final_model_embedding_size}")
+            raise ValueError("模型embedding层小于tokenizer词汇表，这会导致训练错误")
+
+        # 设置pad token（如果需要）
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+            print(f"设置pad_token为: {tokenizer.pad_token}")
+    else:
+        print(f"ℹ️  特殊token已存在，无需调整模型embedding层")
+
+    return model, tokenizer, tokens_added
 def load_data(args, tokenizer):
     # 如果是本地json文件，则直接加载
     if args.train_data.endswith('.json'):
@@ -84,6 +176,12 @@ if __name__ == "__main__":
     args = args_processor.add_args_from_yaml(args)
     model_loader = TransformerModelLoader(tokenizer_path=args.model_name,model_path=args.model_name)
     tokenizer, model = model_loader.load_model_tokenizer()
+
+    # 设置特殊token并调整模型embedding层
+    model, tokenizer, tokens_added = setup_model_and_tokenizer_for_special_tokens(model, tokenizer)
+    if tokens_added:
+        print("✅ 特殊token设置完成，模型已准备好进行训练")
+
     if args.enable_lora:
         lora_args =  argparse.ArgumentParser(description="Lora Configuration parser").parse_args()
         lora_args_processor = ArgsProcessor(args.lora_config_path)
