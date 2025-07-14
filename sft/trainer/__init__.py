@@ -1,2 +1,4 @@
 from .trainer import dLLMTrainer
-__all__ = ["dLLMTrainer"]
+from .dynamic_length_trainer import DynamicLengthTrainer
+
+__all__ = ["dLLMTrainer", "DynamicLengthTrainer"]

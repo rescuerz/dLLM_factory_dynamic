@@ -13,6 +13,7 @@ class dLLMTrainer(Trainer):
         """
         Absorbing state diffusion loss computation
         """
+        print("--------------------------------use dLLMTrainer compute_loss--------------------------------")
         labels, t, num_prompt_tokens = inputs.pop("labels"), inputs.pop("t"), inputs.pop("num_prompt_tokens")
         outputs = model(**inputs)
         logits = outputs.logits

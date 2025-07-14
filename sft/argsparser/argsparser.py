@@ -40,10 +40,10 @@ class ArgsProcessor:
     def add_args_from_yaml(self, args: argparse.Namespace) -> argparse.Namespace:
         """
         Add contents of YAML configuration file to args object.
-        
+
         Args:
             args (argparse.Namespace): Argument namespace to update
-            
+
         Returns:
             argparse.Namespace: Updated argument namespace
         """
@@ -51,23 +51,82 @@ class ArgsProcessor:
         with open(self.config_path, 'r') as f:
             config: Dict[str, Any] = yaml.safe_load(f)
 
-        # Flatten the configuration dictionary
-        flat_config: Dict[str, Any] = self.flatten_dict(config)
+        # Process configuration with support for nested structures
+        processed_config = self._process_config(config)
 
-        # Convert value types (handle floating point numbers and booleans)
-        for key, value in flat_config.items():
-            # Convert to float if possible
-            if isinstance(value, str):
-                if value.lower() in ['true', 'false']:
-                    flat_config[key] = value.lower() == 'true'
-                elif 'e' in value or '.' in value:
-                    try:
-                        flat_config[key] = float(value)
-                    except ValueError:
-                        pass
-
-        # Add the flattened configuration items to args
-        for key, value in flat_config.items():
+        # Add the configuration items to args
+        for key, value in processed_config.items():
             setattr(args, key, value)
 
         return args
+
+    def _process_config(self, config: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Process configuration dictionary, preserving nested structures for specific keys
+        while flattening others.
+
+        Args:
+            config: Raw configuration dictionary
+
+        Returns:
+            Processed configuration dictionary
+        """
+        # Keys that should preserve their nested structure
+        nested_keys = {'dynamic_length', 'optimization', 'special_tokens', 'expansion_decision'}
+
+        processed = {}
+
+        for key, value in config.items():
+            if key in nested_keys and isinstance(value, dict):
+                # Preserve nested structure for specific keys
+                processed[key] = self._convert_types(value)
+            elif isinstance(value, dict):
+                # Flatten other nested dictionaries
+                flat_dict = self.flatten_dict(value)
+                converted_flat = self._convert_types(flat_dict)
+                if isinstance(converted_flat, dict):
+                    processed.update(converted_flat)
+            else:
+                # Direct assignment for non-dict values
+                processed[key] = self._convert_single_value(value)
+
+        return processed
+
+    def _convert_types(self, data):
+        """
+        Recursively convert string values to appropriate types.
+
+        Args:
+            data: Data to convert (dict, list, or single value)
+
+        Returns:
+            Converted data
+        """
+        if isinstance(data, dict):
+            return {k: self._convert_types(v) for k, v in data.items()}
+        elif isinstance(data, list):
+            return [self._convert_types(item) for item in data]
+        else:
+            return self._convert_single_value(data)
+
+    def _convert_single_value(self, value):
+        """
+        Convert a single value to appropriate type.
+
+        Args:
+            value: Value to convert
+
+        Returns:
+            Converted value
+        """
+        if isinstance(value, str):
+            # Convert boolean strings
+            if value.lower() in ['true', 'false']:
+                return value.lower() == 'true'
+            # Convert float strings
+            elif 'e' in value or '.' in value:
+                try:
+                    return float(value)
+                except ValueError:
+                    pass
+        return value

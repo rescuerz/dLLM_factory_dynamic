@@ -135,7 +135,20 @@ def load_data(args, tokenizer):
     eval_dataset = dLLMSFTDataset(eval_data, tokenizer, args.max_length, eval=True)
     return train_dataset, eval_dataset
 
-def train_model(args, model,tokenizer,train_dataset,eval_dataset):
+def train_model(args, model, tokenizer, train_dataset, eval_dataset):
+    # 检查是否启用动态长度微调
+    enable_dynamic_length = getattr(args, 'enable_dynamic_length', False)
+    dynamic_config = getattr(args, 'dynamic_length', None) if enable_dynamic_length else None
+
+    # 将enable_dynamic_length添加到dynamic_config中
+    if enable_dynamic_length and dynamic_config:
+        dynamic_config['enable_dynamic_length'] = enable_dynamic_length
+
+    print(f"🔧 训练模式: {'动态长度微调' if enable_dynamic_length else '标准SFT训练'}")
+    if enable_dynamic_length:
+        print(f"📊 动态长度配置: {dynamic_config}")
+
+    # 创建训练参数
     training_args = TrainingArguments(
         output_dir=os.path.join(args.output_dir, args.job_name),
         num_train_epochs=args.num_epochs,
@@ -154,16 +167,56 @@ def train_model(args, model,tokenizer,train_dataset,eval_dataset):
         report_to=args.report_to,
         remove_unused_columns=args.remove_unused_columns,
     )
-    trainer = dLLMTrainer(
-        model=model,
-        args=training_args,
-        data_collator=dLLMDataCollator(tokenizer=tokenizer, mask_token_id=126336, max_length=args.max_length),
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
-    )
 
-    # Start training
+    # 根据配置选择训练器和数据整理器
+    if enable_dynamic_length:
+        # 使用动态长度训练器
+        from trainer.dynamic_length_trainer import DynamicLengthTrainer
+
+        # 创建支持动态长度的数据整理器
+        data_collator = dLLMDataCollator(
+            tokenizer=tokenizer,
+            mask_token_id=126336,
+            max_length=args.max_length,
+            enable_dynamic_length=True,
+            dynamic_config=dynamic_config
+        )
+
+        # 创建动态长度训练器
+        trainer = DynamicLengthTrainer(
+            model=model,
+            args=training_args,
+            data_collator=data_collator,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            dynamic_config=dynamic_config,
+            tokenizer=tokenizer  # 传递tokenizer给训练器
+        )
+
+        print("✅ 动态长度训练器初始化完成")
+
+    else:
+        # 使用标准训练器（保持现有逻辑不变）
+        data_collator = dLLMDataCollator(
+            tokenizer=tokenizer,
+            mask_token_id=126336,
+            max_length=args.max_length
+        )
+
+        trainer = dLLMTrainer(
+            model=model,
+            args=training_args,
+            data_collator=data_collator,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+        )
+
+        print("✅ 标准dLLM训练器初始化完成")
+
+    # 开始训练
+    print("🚀 开始训练...")
     trainer.train()
+    print("🎉 训练完成！")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Configuration parser")

@@ -19,7 +19,7 @@ bf16: true                                 # 使用bfloat16精度
 report_to: "none"                          # 报告工具，在配置完成 wandb 之后，可选"wandb"
 remove_unused_columns: false               # 是否移除未使用的列
 
-# 动态长度微调配置
+# 动态长度微调配置（阶段1：基础集成）
 enable_dynamic_length: true             # 是否启用动态长度微调（默认禁用，确保向后兼容）
 
 # 动态长度详细配置
