@@ -8,6 +8,17 @@ from .trainer import dLLMTrainer
 # 设置日志
 logger = logging.getLogger(__name__)
 
+# 导入动态长度训练相关函数
+try:
+    from .dynamic_length_sft import (
+        train_dynamic_diffusion_step_multi_expansion,
+        get_mask_token_id
+    )
+except ImportError:
+    logger.warning("Could not import dynamic_length_sft functions, dynamic length training may not work")
+    train_dynamic_diffusion_step_multi_expansion = None
+    get_mask_token_id = None
+
 import contextlib
 import copy
 import functools
@@ -211,8 +222,69 @@ class DynamicLengthTrainer(dLLMTrainer):
             logger.warning("Tokenizer not available, special token IDs will be empty")
             
         return token_ids
-    
-        
+
+    def compute_loss(self, model, inputs, num_items_in_batch=None, return_outputs=False):
+        """
+        重写损失计算方法，支持动态长度训练
+
+        Args:
+            model: 模型实例
+            inputs: 输入数据
+            num_items_in_batch: 批次中的项目数量
+            return_outputs: 是否返回模型输出
+
+        Returns:
+            损失值或(损失值, 模型输出)的元组
+        """
+        # 如果启用动态长度训练且输入包含必要字段，使用动态长度训练
+        if (self.enable_dynamic_length and
+            'prompt_lengths' in inputs and
+            inputs['prompt_lengths'] is not None):
+
+            return self._compute_dynamic_length_loss(model, inputs, num_items_in_batch, return_outputs)
+        else:
+            # 回退到标准dLLM训练
+            return super().compute_loss(model, inputs, num_items_in_batch, return_outputs)
+
+    def _compute_dynamic_length_loss(self, model, inputs, num_items_in_batch, return_outputs):
+        """
+        动态长度训练的损失计算
+        """
+        try:
+            # 检查是否有必要的函数
+            if train_dynamic_diffusion_step_multi_expansion is None:
+                logger.warning("Dynamic length training functions not available, falling back to standard training")
+                return super().compute_loss(model, inputs, num_items_in_batch, return_outputs)
+
+            # 提取必要的输入数据
+            input_ids = inputs['input_ids']
+            prompt_lengths = inputs['prompt_lengths']
+
+            # 获取tokenizer（优先使用processing_class，回退到tokenizer）
+            tokenizer = getattr(self, 'processing_class', None) or getattr(self, 'tokenizer', None)
+            if tokenizer is None:
+                logger.warning("No tokenizer available for dynamic length training, falling back to standard training")
+                return super().compute_loss(model, inputs, num_items_in_batch, return_outputs)
+
+            # 调用动态长度训练核心函数
+            loss = train_dynamic_diffusion_step_multi_expansion(
+                input_ids=input_ids,
+                prompt_length=prompt_lengths,
+                model=model,
+                loss_func=torch.nn.functional.cross_entropy,
+                special_token_ids=self.special_token_ids,
+                device=input_ids.device,
+                config=self.dynamic_config,
+                tokenizer=tokenizer
+            )
+
+            logger.debug(f"Dynamic length loss computed: {loss.item():.4f}")
+            return loss if not return_outputs else (loss, None)
+
+        except Exception as e:
+            logger.warning(f"Dynamic length training failed: {e}, falling back to standard training")
+            # 自动回退到标准训练
+            return super().compute_loss(model, inputs, num_items_in_batch, return_outputs)
 
     # ==================== 提取的Transformers核心训练函数 ====================
 
@@ -792,15 +864,4 @@ class DynamicLengthTrainer(dLLMTrainer):
             return loss.detach()
 
     
-    def compute_loss(self, model, inputs, num_items_in_batch=None, return_outputs=False):
-        """
-        Absorbing state diffusion loss computation
-        """
-        labels, t, num_prompt_tokens = inputs.pop("labels"), inputs.pop("t"), inputs.pop("num_prompt_tokens")
-        outputs = model(**inputs)
-        logits = outputs.logits
-        unscaled_loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), labels.view(-1), reduction="none").view(logits.shape[0], -1)
-        loss = unscaled_loss / t
-        loss = loss.sum() / (inputs["input_ids"].numel() - num_prompt_tokens)
-        return loss if not return_outputs else (loss, outputs)
     
