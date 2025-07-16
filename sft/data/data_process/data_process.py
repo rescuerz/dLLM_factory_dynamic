@@ -160,13 +160,6 @@ def preprocess_dataset(data, tokenizer, max_length, test_split=0.01):
     """
     preprocessed_data = []
 
-    # 清空example.jsonl文件，避免重复数据
-    with open('example.jsonl', 'w', encoding='utf-8') as f:
-        pass  # 创建空文件
-    with open('example_processed.jsonl', 'w', encoding='utf-8') as f:
-        pass  # 创建空文件
-    print("已清空example.jsonl和example_processed.jsonl文件，准备保存新的处理数据")
-
     for i in tqdm(range(len(data)), desc="Preprocessing dataset"):
         # 构建系统提示词 + 问题
         question = SYSTEM_PROMPT + "\n\n" + data[i]["question"]
@@ -206,8 +199,6 @@ def preprocess_dataset(data, tokenizer, max_length, test_split=0.01):
             "prompt": prompt,
             "response": response,
         }
-        with open('example.jsonl', 'a', encoding='utf-8') as f:
-            f.write(json.dumps(sample, ensure_ascii=False) + '\n')
 
         # apply_chat_template 作用机制：将对话格式转换为模型特定的聊天格式
         # 添加特殊标记（如 <|im_start|>, <|im_end|> 等）
@@ -223,9 +214,6 @@ def preprocess_dataset(data, tokenizer, max_length, test_split=0.01):
             "processed_inputs": inputs,
         }
 
-        # 保存到example.jsonl文件（追加模式）
-        with open('example_processed.jsonl', 'a', encoding='utf-8') as f:
-            f.write(json.dumps(processed_sample, ensure_ascii=False) + '\n')
         tokenized_input = tokenizer(
             inputs, return_tensors="pt", truncation=True, max_length=max_length, padding="max_length"
         ).input_ids.squeeze(0)
@@ -242,10 +230,6 @@ def preprocess_dataset(data, tokenizer, max_length, test_split=0.01):
     random.shuffle(preprocessed_data)
     test_data = preprocessed_data[: int(len(preprocessed_data) * test_split)]
     train_data = preprocessed_data[int(len(preprocessed_data) * test_split) :]
-
-    # 打印保存信息
-    print(f"✅ 已将 {len(data)} 个处理后的样本保存到 example.jsonl 文件")
-    print(f"📊 数据分割: 训练集 {len(train_data)} 样本, 验证集 {len(test_data)} 样本")
 
     return train_data, test_data
 
