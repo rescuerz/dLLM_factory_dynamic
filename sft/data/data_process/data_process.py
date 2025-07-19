@@ -208,12 +208,14 @@ def preprocess_dataset(data, tokenizer, max_length, test_split=0.01):
         # 插入特殊token：<|expand|>在长回答的指定位置，<|enough|>在短回答末尾
         inputs = insert_special_tokens(tokenizer, inputs, prompt, trajectory)
 
-        # 将处理好的数据保存到example.jsonl文件中
         processed_sample = {
             "sample_id": i,
             "processed_inputs": inputs,
         }
 
+        # # 保存处理好的数据到example.jsonl文件中
+        # with open('example_processed.jsonl', 'a', encoding='utf-8') as f:
+        #     f.write(json.dumps(processed_sample, ensure_ascii=False) + '\n')
         tokenized_input = tokenizer(
             inputs, return_tensors="pt", truncation=True, max_length=max_length, padding="max_length"
         ).input_ids.squeeze(0)

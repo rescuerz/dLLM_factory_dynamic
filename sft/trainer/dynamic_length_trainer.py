@@ -178,6 +178,50 @@ class DynamicLengthTrainer(dLLMTrainer):
 
         return noisy_input, mask_indices, p_mask, current_input
 
+    def _calculate_special_token_weights(self, input_ids, special_token_ids, config):
+        """
+        为特殊token位置计算权重
+
+        Args:
+            input_ids: 输入token序列
+            special_token_ids: 特殊token ID映射
+            config: 配置对象
+
+        Returns:
+            torch.Tensor: 权重张量，与input_ids形状相同
+        """
+        # 获取特殊token权重配置
+        special_token_weight_multiplier = getattr(config, 'special_token_weight_multiplier', 3.0)
+        enough_token_weight_multiplier = getattr(config, 'enough_token_weight_multiplier', 5.0)  # enough token权重更高
+
+        # 初始化权重为1.0
+        weights = torch.ones_like(input_ids, dtype=torch.float, device=input_ids.device)
+
+        # 为特殊token位置增加权重
+        expand_token_id = special_token_ids.get('expand')
+        enough_token_id = special_token_ids.get('enough')
+
+        special_token_count = 0
+
+        if expand_token_id is not None:
+            expand_positions = (input_ids == expand_token_id)
+            if expand_positions.any():
+                weights[expand_positions] = special_token_weight_multiplier
+                special_token_count += expand_positions.sum().item()
+                logger.debug(f"Applied weight {special_token_weight_multiplier} to {expand_positions.sum().item()} <expand> token positions")
+
+        if enough_token_id is not None:
+            enough_positions = (input_ids == enough_token_id)
+            if enough_positions.any():
+                weights[enough_positions] = enough_token_weight_multiplier
+                special_token_count += enough_positions.sum().item()
+                logger.debug(f"Applied weight {enough_token_weight_multiplier} to {enough_positions.sum().item()} <enough> token positions")
+
+        if special_token_count > 0:
+            logger.info(f"Applied special token weights to {special_token_count} positions")
+
+        return weights
+
     def _train_single_sample_at_length(self, noisy_input, _mask_indices, p_mask, current_input, model, loss_func,
                                     special_token_ids, device, config, mask_token_id):
         """
@@ -225,26 +269,35 @@ class DynamicLengthTrainer(dLLMTrainer):
         outputs = model(input_ids=noisy_input, attention_mask=attention_mask)
         logits = outputs.logits if hasattr(outputs, 'logits') else outputs
 
-        # 计算损失 - 与标准compute_loss保持一致的缩放方式
+        # 计算损失 - 增强版本，支持特殊token权重
         if actual_mask_indices.any():
             # 1. 计算未缩放的损失（与标准方法一致）
             unscaled_loss = loss_func(logits.view(-1, logits.shape[-1]), current_input.view(-1), reduction="none").view(logits.shape[0], -1)
 
-            # 2. 只对被mask的位置计算损失，并按时间步缩放（与标准方法的 unscaled_loss / t 一致）
-            # 这里p_mask相当于标准方法中的t，表示mask概率/时间步
-            masked_unscaled_loss = unscaled_loss[actual_mask_indices]
-            masked_p_mask = p_mask[actual_mask_indices]
-            scaled_loss = masked_unscaled_loss / masked_p_mask
+            # 2. 计算特殊token权重
+            loss_weights = self._calculate_special_token_weights(current_input, special_token_ids, config)
 
-            # 3. 按response中可能被加噪声的token总数进行归一化（与标准方法一致）
-            # 标准方法: loss.sum() / (inputs["input_ids"].numel() - num_prompt_tokens)
-            # 这里: loss.sum() / response_length (response_length是可能被加噪声的token总数)
-            # 从p_mask中计算response长度（非零元素的数量）
+            # 3. 应用特殊token权重到损失
+            weighted_unscaled_loss = unscaled_loss * loss_weights
+
+            # 4. 只对被mask的位置计算损失，并按时间步缩放
+            masked_weighted_loss = weighted_unscaled_loss[actual_mask_indices]
+            masked_p_mask = p_mask[actual_mask_indices]
+            scaled_loss = masked_weighted_loss / masked_p_mask
+
+            # 5. 按response中可能被加噪声的token总数进行归一化
             response_length = (p_mask > 0).sum().item()
             loss = scaled_loss.sum() / max(response_length, 1)  # 避免除零
 
-            logger.info(f"Loss calculation: unscaled_loss={masked_unscaled_loss.sum().item():.4f}, "
-                        f"scaled_loss={scaled_loss.sum().item():.4f}, final_loss={loss.item():.4f}, response_length={response_length}")
+            # 6. 记录详细的损失信息
+            original_masked_loss = unscaled_loss[actual_mask_indices]
+            weight_effect = (masked_weighted_loss.sum() / original_masked_loss.sum()).item() if original_masked_loss.sum() > 0 else 1.0
+
+            logger.info(f"Loss calculation: unscaled_loss={original_masked_loss.sum().item():.4f}, "
+                        f"weighted_loss={masked_weighted_loss.sum().item():.4f}, "
+                        f"weight_effect={weight_effect:.2f}x, "
+                        f"scaled_loss={scaled_loss.sum().item():.4f}, "
+                        f"final_loss={loss.item():.4f}, response_length={response_length}")
         else:
             loss = torch.tensor(0.0, device=device, requires_grad=True)
             logger.info("Loss calculation: no masked positions, loss=0")
@@ -389,28 +442,57 @@ class DynamicLengthTrainer(dLLMTrainer):
             expand_token_id = special_token_ids.get('expand')
             enough_token_id = special_token_ids.get('enough')
 
+            # 找到概率最大的token及其概率
+            max_prob_value, max_prob_token_id = torch.max(probabilities, dim=0)
+            max_prob_value = max_prob_value.item()
+            max_prob_token_id = max_prob_token_id.item()
+
+            # 获取tokenizer来解码最大概率token（如果可用）
+            tokenizer = getattr(self, 'processing_class', None) or getattr(self, 'tokenizer', None)
+            if tokenizer is not None:
+                try:
+                    max_prob_token_text = tokenizer.decode([max_prob_token_id], skip_special_tokens=False)
+                    # 清理token文本，移除可能的空格
+                    max_prob_token_text = max_prob_token_text.strip()
+                except:
+                    max_prob_token_text = f"<token_id_{max_prob_token_id}>"
+            else:
+                max_prob_token_text = f"<token_id_{max_prob_token_id}>"
+
+            # 获取特殊token概率
+            expand_prob = probabilities[expand_token_id].item() if expand_token_id is not None and expand_token_id < logits.size(-1) else 0.0
+            enough_prob = probabilities[enough_token_id].item() if enough_token_id is not None and enough_token_id < logits.size(-1) else 0.0
+
             # 记录所有特殊token的概率
             token_probs = {}
             for token_name, token_id in special_token_ids.items():
                 if token_id is not None and token_id < logits.size(-1):
                     token_probs[token_name] = probabilities[token_id].item()
 
+            # 判断最大概率token是否为特殊token
+            is_max_special = max_prob_token_id in [expand_token_id, enough_token_id]
+            
             logger.info(f"Model prediction at position {max_absolute_pos}: special_token_probs={token_probs}")
-
+            logger.info(f"Max probability token: '{max_prob_token_text}' (id={max_prob_token_id}) = {max_prob_value:.4f}, is_max_special={is_max_special}")
             # 检查expand token概率
-            if expand_token_id is not None and expand_token_id < logits.size(-1):
-                expand_prob = probabilities[expand_token_id].item()
-                if expand_prob > config.confidence_threshold:
-                    logger.info(f"Model predicts <expand> token, prob={expand_prob:.4f} > threshold={config.confidence_threshold}")
+            # if expand_token_id is not None and expand_token_id < logits.size(-1):
+            #     if expand_prob > config.confidence_threshold:
+            #         logger.info(f"Model predicts <expand> token, prob={expand_prob:.4f} > threshold={config.confidence_threshold}")
+            #         return {'expand': True, 'confidence': expand_prob, 'method': 'model_prediction_reused', 'position': max_absolute_pos}
+
+            # # 检查enough token概率
+            # if enough_token_id is not None and enough_token_id < logits.size(-1):
+            #     if enough_prob > config.confidence_threshold:
+            #         logger.info(f"Model predicts <enough> token, prob={enough_prob:.4f} > threshold={config.confidence_threshold}")
+            #         return {'expand': False, 'confidence': enough_prob, 'reason': 'enough', 'method': 'model_prediction_reused', 'position': max_absolute_pos}
+
+            if is_max_special:
+                if max_prob_token_id == expand_token_id:
+                    logger.info(f"Model predicts <expand> token")
                     return {'expand': True, 'confidence': expand_prob, 'method': 'model_prediction_reused', 'position': max_absolute_pos}
-
-            # 检查enough token概率
-            if enough_token_id is not None and enough_token_id < logits.size(-1):
-                enough_prob = probabilities[enough_token_id].item()
-                if enough_prob > config.confidence_threshold:
-                    logger.info(f"Model predicts <enough> token, prob={enough_prob:.4f} > threshold={config.confidence_threshold}")
+                if max_prob_token_id == enough_token_id:
+                    logger.info(f"Model predicts <enough> token")
                     return {'expand': False, 'confidence': enough_prob, 'reason': 'enough', 'method': 'model_prediction_reused', 'position': max_absolute_pos}
-
         logger.info(f"Model prediction confidence too low, stopping expansion")
         return {'expand': False, 'confidence': 0.0, 'reason': 'low_confidence', 'method': 'model_prediction_reused'}
 
@@ -608,7 +690,7 @@ class DynamicLengthTrainer(dLLMTrainer):
                 def __init__(self, config_dict):
                     # 映射YAML配置文件中的键名到代码中使用的属性名
                     self.expansion_check_ratio = config_dict.get('expansion_check_ratio', 0.35)
-                    self.confidence_threshold = config_dict.get('confidence_threshold', 0.7)
+                    self.confidence_threshold = config_dict.get('confidence_threshold', 0.1)  # 更新默认值
                     self.max_expansions = config_dict.get('max_expansions', 5)
                     # 映射exclude_from_attention到exclude_special_tokens_from_attention
                     self.exclude_special_tokens_from_attention = config_dict.get('exclude_from_attention', False)
@@ -617,6 +699,10 @@ class DynamicLengthTrainer(dLLMTrainer):
                     # 添加其他可能的配置项
                     self.initial_response_length = config_dict.get('initial_response_length', 64)
                     self.expansion_steps = config_dict.get('expansion_steps', [64, 128, 256, 512, 1024, 2048])
+
+                    # 特殊token权重配置
+                    self.special_token_weight_multiplier = config_dict.get('special_token_weight_multiplier', 3.0)
+                    self.enough_token_weight_multiplier = config_dict.get('enough_token_weight_multiplier', 5.0)
 
             # 创建配置对象以保持代码兼容性
             config_obj = DynamicConfig(self.dynamic_config)

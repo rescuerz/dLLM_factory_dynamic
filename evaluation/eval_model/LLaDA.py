@@ -41,6 +41,14 @@ from lm_eval.models.utils import (
 )
 
 eval_logger = logging.getLogger(__name__)
+
+# 导入动态长度生成功能
+try:
+    from .dynamic_generation import generate_dynamic_length
+    DYNAMIC_GENERATION_AVAILABLE = True
+except ImportError:
+    DYNAMIC_GENERATION_AVAILABLE = False
+    eval_logger.warning("Dynamic generation module not available. Dynamic length generation will be disabled.")
 from dllm_cache.cache import  dLLMCacheConfig,dLLMCache
 from dllm_cache.hooks import  register_cache_LLaDA
 from dataclasses import asdict
@@ -64,10 +72,15 @@ def add_gumbel_noise(logits, temperature):
 
 
 def get_num_transfer_tokens(mask_index, steps):
+    # 计算每个样本中待生成位置的数量
     mask_num = mask_index.sum(dim=1, keepdim=True)
+    # 计算每个样本中待生成位置的平均数量
     base = mask_num // steps
+    # 计算剩余的待生成位置数量
     remainder = mask_num % steps
+    # 初始化每个样本的转移token数量
     num_transfer_tokens = base.expand(-1, steps).clone()
+    # 如果剩余的待生成位置数量大于0，则将剩余的待生成位置分配给前几个样本
     if remainder.sum() > 0:
         indices = torch.arange(steps, device=mask_index.device)
         mask = indices.unsqueeze(0) < remainder
@@ -89,49 +102,61 @@ def generate(
 ):
     with torch.no_grad():
         batch_size, prompt_length = input_ids.shape
+        # 创建完整序列：prompt + 待生成部分（全部用mask_id填充）
         x = torch.full(
             (batch_size, prompt_length + gen_length),
             mask_id,
             dtype=torch.long,
             device=model.device,
         )
+        # 保留原始的prompt部分
         x[:, :prompt_length] = input_ids
-
+        # 创建一个布尔掩码，用于标记哪些位置是待生成的部分
         prompt_index = x != mask_id
 
+        # 确保生成长度是block长度的整数倍， 计算生成块数num_blocks
         assert gen_length % block_length == 0
         num_blocks = gen_length // block_length
-
+        # 确保steps是num_blocks的整数倍， 计算每个块的生成步数steps_per_block
         assert steps % num_blocks == 0
         steps_per_block = steps // num_blocks
 
         feature_cache = dLLMCache()
         feature_cache.reset_cache(prompt_length)
+        # 对每个块进行 steps_per_block次迭代：
         for num_block in range(num_blocks):
+            # 计算当前块的起始和结束索引
             start_idx = prompt_length + num_block * block_length
             end_idx = prompt_length + (num_block + 1) * block_length
-
+            # 获取当前块的输入和掩码
             block_x = x[:, start_idx:end_idx]
             block_mask_index = block_x == mask_id
+            # 计算每一步需要unmask的token数量
             num_transfer_tokens = get_num_transfer_tokens(
                 block_mask_index, steps_per_block
             )
 
             for i in range(steps_per_block):
+                # 标记哪些位置是待生成的部分
                 mask_index = x == mask_id
                 if cfg_scale > 0.0:
                     if hasattr(feature_cache, "cfg_interval_steps"):
                         feature_cache.update_step(layer_id=33)
                         if feature_cache.refresh_cfg(layer_id=33):
+                            # 创建无条件输入（prompt也被mask）
                             cfg_x = x.clone()
                             cfg_x[prompt_index] = mask_id
+
+                            # 计算条件生成的logits
                             logits = model(x, attention_mask=attention_mask).logits[
                                 :, prompt_length:
                             ]
                             feature_cache.cache_type = "cfg"
+                            # 计算无条件生成的logits
                             cfg_logits = model(
                                 cfg_x, attention_mask=attention_mask
                             ).logits[:, prompt_length:]
+                            # 计算并缓存CFG残差
                             cfg_residual = logits - cfg_logits
                             feature_cache.set_cache(
                                 layer_id=33,
@@ -141,6 +166,7 @@ def generate(
                             )
                             feature_cache.cache_type = "no_cfg"
                         else:
+                            # 如果CFG缓存未刷新，则从缓存中获取CFG残差
                             feature_cache.cache_type = "cfg"
                             cfg_residual = feature_cache.get_cache(
                                 layer_id=33,
@@ -152,6 +178,7 @@ def generate(
                                 :, prompt_length:
                             ]
                     else:
+                        # 无缓存的CFG， 计算CFG残差
                         cfg_x = x.clone()
                         cfg_x[prompt_index] = mask_id
                         logits = model(x, attention_mask=attention_mask).logits[
@@ -161,15 +188,19 @@ def generate(
                             :, prompt_length:
                         ]
                         cfg_residual = logits - cfg_logits
+                    # CFG公式：logits_final = logits + cfg_scale * cfg_residual
                     logits = (logits - cfg_residual) + (cfg_scale + 1) * cfg_residual
                 else:
+                    # 无CFG， 直接计算logits
                     logits = model(x, attention_mask=attention_mask).logits[
                         :, prompt_length:
                     ]
+                # 添加Gumbel噪声
                 logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
-
+                # 选择概率最高的token
                 x0 = torch.argmax(logits_with_noise, dim=-1)
 
+                # 低置信度重掩蔽
                 if remasking == "low_confidence":
                     p = F.softmax(logits, dim=-1)
                     x0_p = torch.squeeze(
@@ -180,21 +211,27 @@ def generate(
                 else:
                     raise NotImplementedError(remasking)
 
+                # 确保不会更新当前快之外的位置
                 x0_p[:, (num_block + 1) * block_length :] = -np.inf
 
+                # 只在mask位置应用预测，非mask位置保持不变
                 x0 = torch.where(
                     mask_index[:, prompt_length:], x0, x[:, prompt_length:]
                 )
+                # 计算置信度，只在mask位置应用预测，非mask位置置信度为-inf
                 confidence = torch.where(mask_index[:, prompt_length:], x0_p, -np.inf)
 
+                # 计算需要转移的token索引，为每个样本选择置信度最高的num_transfer_tokens[j, i]个token
                 transfer_index = torch.zeros_like(
                     x0, dtype=torch.bool, device=x0.device
                 )
                 for j in range(confidence.shape[0]):
+                    # 选择置信度最高的num_transfer_tokens[j, i]个token
                     select_index = torch.topk(
                         confidence[j], k=num_transfer_tokens[j, i]
                     ).indices
                     transfer_index[j, select_index] = True
+                # 实际更新选中的位置
                 x[:, prompt_length:][transfer_index] = x0[transfer_index]
         return x[:, prompt_length:]
 
@@ -690,12 +727,47 @@ class LLaDA(TemplateLM):
         gguf_file: Optional[str] = None,
     ) -> None:
         """Return the model config for HuggingFace models"""
-        self._config = transformers.AutoConfig.from_pretrained(
-            pretrained,
-            revision=revision,
-            trust_remote_code=trust_remote_code,
-            gguf_file=gguf_file,
-        )
+
+        # 检查是否是 LoRA 检查点目录
+        import os
+        import json
+        adapter_config_path = os.path.join(pretrained, "adapter_config.json")
+        is_lora_checkpoint = os.path.exists(adapter_config_path)
+
+        if is_lora_checkpoint:
+            # 对于 LoRA 检查点，从 adapter_config.json 获取基础模型路径
+            eval_logger.info(f"🔧 Detected LoRA checkpoint, loading config from base model")
+            try:
+                with open(adapter_config_path, 'r') as f:
+                    adapter_config = json.load(f)
+                base_model_path = adapter_config.get("base_model_name_or_path", "GSAI-ML/LLaDA-8B-Instruct")
+                eval_logger.info(f"📦 Using base model config from: {base_model_path}")
+
+                # 从基础模型加载配置
+                self._config = transformers.AutoConfig.from_pretrained(
+                    base_model_path,
+                    revision=revision,
+                    trust_remote_code=trust_remote_code,
+                    gguf_file=gguf_file,
+                )
+            except Exception as e:
+                eval_logger.warning(f"⚠️  Failed to load config from LoRA checkpoint: {e}")
+                eval_logger.info("🔄 Falling back to standard config loading...")
+                # 回退到标准配置加载
+                self._config = transformers.AutoConfig.from_pretrained(
+                    pretrained,
+                    revision=revision,
+                    trust_remote_code=trust_remote_code,
+                    gguf_file=gguf_file,
+                )
+        else:
+            # 标准配置加载
+            self._config = transformers.AutoConfig.from_pretrained(
+                pretrained,
+                revision=revision,
+                trust_remote_code=trust_remote_code,
+                gguf_file=gguf_file,
+            )
 
     def _create_model(
         self,
@@ -732,8 +804,11 @@ class LLaDA(TemplateLM):
         """
         if autogptq or gptqmodel:
             raise ValueError("'autogptq' and 'gptqmodel' are not supported yet")
-        if peft or delta:
-            raise ValueError("'peft' and 'delta' are not supported yet")
+
+        # 移除 PEFT 限制，现在支持 LoRA 检查点加载
+        if delta:
+            raise ValueError("'delta' weights are not supported yet")
+
         model_kwargs = kwargs if kwargs else {}
 
         model_kwargs.update(
@@ -746,14 +821,120 @@ class LLaDA(TemplateLM):
                 gpus=gpus,
             )
         )
-            
-        self._model = transformers.AutoModel.from_pretrained(
-            pretrained,
-            revision=revision,
-            torch_dtype=get_dtype(dtype),
-            trust_remote_code=trust_remote_code
-        )
+
+        # 检查是否是 LoRA 检查点目录
+        import os
+        import json
+        adapter_config_path = os.path.join(pretrained, "adapter_config.json")
+        is_lora_checkpoint = os.path.exists(adapter_config_path)
+
+        if is_lora_checkpoint:
+            # 加载 LoRA 检查点
+            eval_logger.info(f"🔧 Detected LoRA checkpoint at: {pretrained}")
+
+            # 读取 adapter_config.json 获取基础模型路径
+            try:
+                with open(adapter_config_path, 'r') as f:
+                    adapter_config = json.load(f)
+                base_model_path = adapter_config.get("base_model_name_or_path", "GSAI-ML/LLaDA-8B-Instruct")
+                eval_logger.info(f"📦 Base model path: {base_model_path}")
+                eval_logger.info(f"🎯 LoRA config - rank: {adapter_config.get('r', 'N/A')}, alpha: {adapter_config.get('lora_alpha', 'N/A')}")
+
+                # 先加载基础模型（激进内存优化）
+                eval_logger.info("🚀 Loading base model with aggressive memory optimization...")
+
+                # 清理 GPU 缓存
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    eval_logger.info(f"💾 GPU memory before loading: {torch.cuda.memory_allocated()/1024**3:.2f}GB")
+
+                # 激进的内存优化参数
+                memory_optimized_kwargs = model_kwargs.copy()
+                memory_optimized_kwargs.update({
+                    "low_cpu_mem_usage": True,
+                    "torch_dtype": get_dtype(dtype),
+                    "device_map": "auto",
+                    "max_memory": {0: "35GB"},  # 限制 GPU 0 使用 35GB，留出 12GB 缓冲
+                    "offload_folder": "./temp_offload",  # 临时卸载目录
+                    "offload_state_dict": True,
+                })
+
+                self._model = transformers.AutoModel.from_pretrained(
+                    base_model_path,
+                    revision=revision,
+                    trust_remote_code=trust_remote_code,
+                    **memory_optimized_kwargs
+                )
+
+                if torch.cuda.is_available():
+                    eval_logger.info(f"💾 GPU memory after base model: {torch.cuda.memory_allocated()/1024**3:.2f}GB")
+
+                # 然后加载 LoRA 适配器（内存优化）
+                eval_logger.info("🔗 Loading LoRA adapter with memory optimization...")
+
+                # 再次清理缓存
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+                from peft import PeftModel
+                self._model = PeftModel.from_pretrained(
+                    self._model,
+                    pretrained,
+                    torch_dtype=get_dtype(dtype),
+                    is_trainable=False,
+                    adapter_name="default"  # 明确指定适配器名称
+                )
+
+                if torch.cuda.is_available():
+                    eval_logger.info(f"💾 GPU memory after LoRA: {torch.cuda.memory_allocated()/1024**3:.2f}GB")
+
+                eval_logger.info("✅ LoRA adapter loaded successfully")
+
+            except Exception as e:
+                eval_logger.error(f"❌ Failed to load LoRA checkpoint: {e}")
+                eval_logger.info("🔄 Falling back to standard model loading...")
+                # 回退到标准加载
+                self._model = transformers.AutoModel.from_pretrained(
+                    pretrained,
+                    revision=revision,
+                    torch_dtype=get_dtype(dtype),
+                    trust_remote_code=trust_remote_code,
+                    **model_kwargs
+                )
+
+        elif peft:
+            # 处理通过 peft 参数指定的 LoRA 路径
+            eval_logger.info(f"🔧 Loading base model and applying PEFT from: {peft}")
+            self._model = transformers.AutoModel.from_pretrained(
+                pretrained,
+                revision=revision,
+                torch_dtype=get_dtype(dtype),
+                trust_remote_code=trust_remote_code,
+                **model_kwargs
+            )
+            from peft import PeftModel
+            self._model = PeftModel.from_pretrained(
+                self._model,
+                peft,
+                torch_dtype=get_dtype(dtype),
+                is_trainable=False
+            )
+            eval_logger.info("✅ PEFT adapter loaded successfully")
+
+        else:
+            # 标准模型加载（保持向后兼容）
+            eval_logger.info(f"📦 Loading standard model from: {pretrained}")
+            self._model = transformers.AutoModel.from_pretrained(
+                pretrained,
+                revision=revision,
+                torch_dtype=get_dtype(dtype),
+                trust_remote_code=trust_remote_code,
+                **model_kwargs
+            )
+
         self._model = self._model.to(self.device).eval()
+        eval_logger.info(f"🎯 Model loaded and moved to device: {self.device}")
             
 
 
@@ -807,9 +988,36 @@ class LLaDA(TemplateLM):
             # Get tokenizer based on 'pretrained'
             if isinstance(pretrained, str):
                 model_name = pretrained
+
+                # 检查是否是 LoRA 检查点目录
+                import os
+                import json
+                adapter_config_path = os.path.join(pretrained, "adapter_config.json")
+                is_lora_checkpoint = os.path.exists(adapter_config_path)
+
+                if is_lora_checkpoint:
+                    # 对于 LoRA 检查点，检查是否有分词器文件
+                    tokenizer_files = ["tokenizer.json", "tokenizer_config.json"]
+                    has_tokenizer = any(os.path.exists(os.path.join(pretrained, f)) for f in tokenizer_files)
+
+                    if has_tokenizer:
+                        eval_logger.info(f"🔤 Loading tokenizer from LoRA checkpoint: {pretrained}")
+                        model_name = pretrained
+                    else:
+                        # 从基础模型加载分词器
+                        try:
+                            with open(adapter_config_path, 'r') as f:
+                                adapter_config = json.load(f)
+                            base_model_path = adapter_config.get("base_model_name_or_path", "GSAI-ML/LLaDA-8B-Instruct")
+                            eval_logger.info(f"🔤 Loading tokenizer from base model: {base_model_path}")
+                            model_name = base_model_path
+                        except Exception as e:
+                            eval_logger.warning(f"⚠️  Failed to get base model path: {e}")
+                            model_name = pretrained
             else:
                 # get the HF hub name via accessor on model
                 model_name = self.model.name_or_path
+
             self.tokenizer = transformers.AutoTokenizer.from_pretrained(
                 model_name, **kwargs
             )
@@ -924,6 +1132,17 @@ class LLaDA(TemplateLM):
         ds = [{"text": req.args[0]} for req in requests]
         ds = Dataset.from_list(ds)
         gen_kwargs = requests[0].args[1]
+
+        # 检查是否启用动态长度生成
+        enable_dynamic = gen_kwargs.get("enable_dynamic_length", False)
+
+        if enable_dynamic and not DYNAMIC_GENERATION_AVAILABLE:
+            eval_logger.warning("Dynamic length generation requested but module not available. Falling back to fixed length generation.")
+            enable_dynamic = False
+
+        if enable_dynamic:
+            eval_logger.info("Using dynamic length generation")
+
         for batch in ds.iter(self.batch_size):
             contexts = batch["text"]
             if self.add_bos_token:
@@ -932,16 +1151,42 @@ class LLaDA(TemplateLM):
                 contexts,
                 truncation=self.truncation,
             )
-            out = generate(
-                input_ids=context_enc,
-                attention_mask=attn_masks,
-                model=self.model,
-                steps=gen_kwargs.get("steps"),
-                gen_length=gen_kwargs.get("gen_length"),
-                block_length=gen_kwargs.get("block_length"),
-                cfg_scale=gen_kwargs.get("cfg_scale"),
-                remasking=gen_kwargs.get("remasking",None) if gen_kwargs.get("remasking",None) else "low_confidence"
-            )
+
+            # 选择生成方法
+            if enable_dynamic:
+                # 为动态长度生成添加必要的默认参数
+                dynamic_gen_kwargs = self._prepare_dynamic_gen_kwargs(gen_kwargs)
+
+                # 使用动态长度生成
+                out = self._generate_dynamic_length_batch(
+                    input_ids=context_enc,
+                    attention_mask=attn_masks,
+                    model=self.model,
+                    tokenizer=self.tokenizer,
+                    gen_kwargs=dynamic_gen_kwargs
+                )
+                # 动态长度生成返回的是tensor列表，需要转换为适合batch_decode的格式
+                if isinstance(out, list) and len(out) > 0:
+                    # 由于每个样本的生成长度可能不同，需要分别处理
+                    # 将每个tensor转换为列表，然后组合成一个列表
+                    out_list = []
+                    for tensor in out:
+                        # tensor形状是[1, gen_length]，转换为[gen_length]
+                        out_list.append(tensor.squeeze(0))
+                    out = out_list
+            else:
+                # 使用原有固定长度生成
+                out = generate(
+                    input_ids=context_enc,
+                    attention_mask=attn_masks,
+                    model=self.model,
+                    steps=gen_kwargs.get("steps"),
+                    gen_length=gen_kwargs.get("gen_length"),
+                    block_length=gen_kwargs.get("block_length"),
+                    cfg_scale=gen_kwargs.get("cfg_scale"),
+                    remasking=gen_kwargs.get("remasking",None) if gen_kwargs.get("remasking",None) else "low_confidence"
+                )
+
             cont_toks_list = self.tokenizer.batch_decode(out, skip_special_tokens=True)
             for s in cont_toks_list:
                 if not self.escape_until:
@@ -953,7 +1198,90 @@ class LLaDA(TemplateLM):
             req.append(contexts)
         bar.close()
         return res
-    
+
+    def _prepare_dynamic_gen_kwargs(self, gen_kwargs: dict) -> dict:
+        """
+        为动态长度生成准备参数，添加必要的默认值
+
+        Args:
+            gen_kwargs: 原始生成参数
+
+        Returns:
+            dict: 包含动态长度生成所需参数的字典
+        """
+        dynamic_kwargs = gen_kwargs.copy()
+
+        # 添加动态长度生成的必需参数默认值
+        if "initial_length" not in dynamic_kwargs:
+            dynamic_kwargs["initial_length"] = 64
+
+        if "expansion_steps" not in dynamic_kwargs:
+            dynamic_kwargs["expansion_steps"] = [64, 128, 256, 512, 1024, 2048]
+
+        if "max_expansions" not in dynamic_kwargs:
+            dynamic_kwargs["max_expansions"] = 5
+
+        # 确保基本参数有默认值
+        if "steps" not in dynamic_kwargs:
+            dynamic_kwargs["steps"] = 128
+
+        if "block_length" not in dynamic_kwargs:
+            dynamic_kwargs["block_length"] = 64
+
+        if "cfg_scale" not in dynamic_kwargs:
+            dynamic_kwargs["cfg_scale"] = 0.0
+
+        if "remasking" not in dynamic_kwargs:
+            dynamic_kwargs["remasking"] = "low_confidence"
+
+        if "mask_id" not in dynamic_kwargs:
+            dynamic_kwargs["mask_id"] = 126336
+
+        eval_logger.debug(f"Dynamic generation parameters: {dynamic_kwargs}")
+        return dynamic_kwargs
+
+    def _generate_dynamic_length_batch(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        model,
+        tokenizer,
+        gen_kwargs: dict
+    ) -> torch.Tensor:
+        """
+        使用动态长度生成处理批次数据
+
+        Args:
+            input_ids: 输入token序列 [batch_size, prompt_length]
+            attention_mask: 注意力掩码
+            model: 生成模型
+            tokenizer: 分词器
+            gen_kwargs: 生成参数字典
+
+        Returns:
+            torch.Tensor: 生成的token序列 [batch_size, actual_gen_length]
+        """
+        batch_size = input_ids.shape[0]
+        eval_logger.info(f"Processing batch of size {batch_size} with dynamic length generation")
+        results = []
+        try:
+            for i in range(batch_size):
+                single_input = input_ids[i:i+1]  # 保持维度 [1, prompt_length]
+                single_mask = attention_mask[i:i+1] if attention_mask is not None else torch.ones_like(single_input)
+                single_result = generate_dynamic_length(
+                    input_ids=single_input,
+                    attention_mask=single_mask,
+                    model=model,
+                    tokenizer=tokenizer,
+                    gen_kwargs=gen_kwargs
+                )
+                results.append(single_result)
+        except Exception as e:
+            raise RuntimeError(f"Dynamic length generation failed: {str(e)}") from e
+
+        
+        return results
+
     def apply_chat_template(
         self, chat_history: List[Dict[str, str]], add_generation_prompt: bool = True
     ) -> str:
